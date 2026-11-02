@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""macOS Navicat 状态清理：默认预览，仅依赖 Python 3.9+ 标准库。"""
+"""macOS / Windows Navicat 状态清理：默认预览，仅依赖 Python 3.9+ 标准库。"""
 
 import argparse
 import copy
@@ -206,17 +206,34 @@ def apply_plan(plan):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true', help='执行清理；默认只预览')
-    parser.add_argument('--app', type=Path, default=Path('/Applications/Navicat Premium.app'), help='应用路径')
+    parser.add_argument('--app', type=Path, help='macOS 应用路径；Windows 自动定位当前用户注册表')
     args = parser.parse_args(argv)
-    if sys.platform != 'darwin':
-        parser.error('仅支持 macOS')
-    if os.geteuid() == 0:
-        parser.error('请以普通用户身份运行，不要使用 sudo')
-    home = Path(os.environ.get('HOME', ''))
-    if not home.is_absolute() or home == Path('/'):
-        parser.error('HOME 必须是用户主目录的绝对路径')
+    if sys.platform not in ('darwin', 'win32'):
+        parser.error('仅支持 macOS 和 Windows')
+    if sys.platform == 'win32' and args.app is not None:
+        parser.error('--app 仅用于 macOS；Windows 自动定位当前用户注册表')
     try:
-        plan = build_plan(args.app.expanduser(), home)
+        if sys.platform == 'win32':
+            import windows_reset
+            registry = windows_reset.Registry()
+            actions = windows_reset.build_plan(registry)
+            print('模式：执行' if args.apply else '模式：仅预览')
+            windows_reset.print_plan(actions)
+            if not actions:
+                print('没有发现符合规则的目标；这不代表试用状态已重置。')
+            elif args.apply:
+                windows_reset.apply_plan(actions, registry)
+                print('已完成列出的清理操作。是否生效需要重新打开 Navicat 验证。')
+            else:
+                print('预览结束，没有修改数据。核对后加 --apply 执行。')
+            return 0
+        if os.geteuid() == 0:
+            parser.error('请以普通用户身份运行，不要使用 sudo')
+        home = Path(os.environ.get('HOME', ''))
+        if not home.is_absolute() or home == Path('/'):
+            parser.error('HOME 必须是用户主目录的绝对路径')
+        application = args.app or Path('/Applications/Navicat Premium.app')
+        plan = build_plan(application.expanduser(), home)
         print('模式：执行' if args.apply else '模式：仅预览')
         print_plan(plan)
         if plan.empty:
