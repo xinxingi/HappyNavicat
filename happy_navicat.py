@@ -4,8 +4,6 @@
 import argparse
 import copy
 from dataclasses import dataclass
-from datetime import datetime
-import json
 import os
 from pathlib import Path
 import plistlib
@@ -13,7 +11,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 from typing import Optional
 
 STATE_DIR = 'Library/Application Support/PremiumSoft CyberTech/Navicat CC/Navicat Premium'
@@ -21,18 +18,6 @@ STATE_DIR = 'Library/Application Support/PremiumSoft CyberTech/Navicat CC/Navica
 
 def is_hash(value):
     return re.fullmatch(r'[0-9A-F]{32}', value) is not None
-
-
-def version_info(text):
-    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){0,2}', text):
-        raise ValueError(f'无法识别版本号：{text}')
-    parts = [int(part) for part in text.split('.')]
-    major, minor, patch = (parts + [0, 0])[:3]
-    services = {15: 'com.prect.NavicatPremium15', 16: 'com.navicat.NavicatPremium',
-                17: 'com.navicat.NavicatPremium'}
-    if major not in services:
-        raise ValueError(f'当前仅处理 Navicat 15、16、17，无法处理 {text}')
-    return services[major], major == 17 and (minor, patch) >= (3, 7)
 
 
 def run_command(*arguments):
@@ -101,6 +86,8 @@ def parse_keychain_accounts(text, expected_service):
 
 def keychain_accounts(path, service):
     # 不使用 -d/-r，不读取或导出密码内容。
+    if not path.exists():
+        return []
     data = run_command('/usr/bin/security', 'dump-keychain', str(path))
     return parse_keychain_accounts(data.decode('utf-8'), service)
 
@@ -123,30 +110,30 @@ class Plan:
     files: list
     keychain: Path
     accounts: list
-    needs_keychain: bool
 
     @property
     def empty(self):
         return not (self.keys or self.files or self.accounts)
 
 
-def build_plan(app, home, include_keychain):
+def build_plan(app, home):
     with (app / 'Contents/Info.plist').open('rb') as source:
         info = plistlib.load(source)
-    if not isinstance(info, dict) or not isinstance(info.get('CFBundleShortVersionString'), str):
-        raise ValueError('应用 Info.plist 缺少有效的版本号')
-    version = info['CFBundleShortVersionString']
-    service, needs_keychain = version_info(version)
-    if info.get('CFBundleIdentifier') != service:
-        raise ValueError(f'应用 Bundle ID 与预期的 {service} 不符，拒绝处理')
-    if include_keychain and not needs_keychain:
-        raise ValueError('--include-keychain 仅适用于 17.3.7 及以上的 17.x 版本')
+    if not isinstance(info, dict):
+        raise ValueError('应用 Info.plist 顶层不是字典')
+    service = info.get('CFBundleIdentifier')
+    if not isinstance(service, str) or not re.fullmatch(r'com\.(?:navicat|prect)\.NavicatPremium[0-9]*', service):
+        raise ValueError('应用 Bundle ID 不是 Navicat Premium，拒绝处理')
+    # 版本号仅用于显示，不参与目标筛选；缺失或预发布版本也不阻止执行。
+    version = info.get('CFBundleShortVersionString')
+    if not isinstance(version, str) or not version.strip():
+        version = '未知版本'
     preferences = home / f'Library/Preferences/{service}.plist'
     snapshot = read_preferences(preferences)
     keys = sorted(key for key in (snapshot or {}) if is_hash(key))
     keychain = home / 'Library/Keychains/login.keychain-db'
     return Plan(version, service, preferences, snapshot, keys, find_hidden_files(home / STATE_DIR),
-                keychain, keychain_accounts(keychain, service) if include_keychain else [], needs_keychain)
+                keychain, keychain_accounts(keychain, service))
 
 
 def print_plan(plan):
@@ -158,16 +145,6 @@ def print_plan(plan):
     for account in plan.accounts:
         print(f'  钥匙串：service={plan.service} account={account}')
     print(f'共 {len(plan.keys)} 个偏好设置键、{len(plan.files)} 个隐藏文件、{len(plan.accounts)} 个钥匙串条目。')
-    if plan.accounts:
-        print('注意：钥匙串条目不会备份，删除后无法通过文件备份恢复。')
-
-
-def write_private(path, content):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, 'wb') as destination:
-        destination.write(content)
-        destination.flush()
-        os.fsync(destination.fileno())
 
 
 def assert_preferences_unchanged(plan):
@@ -177,16 +154,10 @@ def assert_preferences_unchanged(plan):
 
 def assert_file_unchanged(path, expected):
     if not regular_file(path) or path.read_bytes() != expected:
-        raise RuntimeError(f'文件在备份后发生变化，拒绝删除：{path}')
+        raise RuntimeError(f'文件在检查后发生变化，拒绝删除：{path}')
 
 
-def journal(log, action, target):
-    log.write(json.dumps({'action': action, 'target': target}, ensure_ascii=False) + '\n')
-    log.flush()
-    os.fsync(log.fileno())
-
-
-def apply_plan(plan, backup_root):
+def apply_plan(plan):
     if navicat_running():
         raise RuntimeError('请保存工作并手动退出 Navicat Premium 后重试')
     assert_preferences_unchanged(plan)
@@ -195,76 +166,47 @@ def apply_plan(plan, backup_root):
         if not regular_file(path):
             raise RuntimeError(f'目标已消失：{path}')
         contents[path] = path.read_bytes()
-    if plan.accounts and keychain_accounts(plan.keychain, plan.service) != plan.accounts:
+    if keychain_accounts(plan.keychain, plan.service) != plan.accounts:
         raise RuntimeError('钥匙串匹配条目发生变化，请重新预览')
-    backup_root.mkdir(parents=True, exist_ok=True)
-    backup = Path(tempfile.mkdtemp(prefix=datetime.now().strftime('%Y%m%d-%H%M%S-'), dir=backup_root))
-    print(f'备份目录：{backup}')
-    try:
-        execute_with_backup(plan, backup, contents)
-    except Exception:
-        print(f'操作未全部完成；请检查备份及 journal.jsonl，已执行操作不会自动回滚：{backup}', file=sys.stderr)
-        raise
-    return backup
-
-
-def execute_with_backup(plan, backup, contents):
-    if plan.keys:
-        write_private(backup / 'preferences.plist', plistlib.dumps(plan.snapshot))
-    files = []
-    for index, (path, content) in enumerate(contents.items()):
-        name = f'hidden-{index}.bin'
-        write_private(backup / name, content)
-        files.append({'original': str(path), 'backup': name})
-    manifest = {
-        'format_version': 1, 'navicat_version': plan.version, 'service': plan.service,
-        'preferences_path': str(plan.preferences),
-        'preferences_backup': 'preferences.plist' if plan.keys else None,
-        'removed_preference_keys': plan.keys, 'files': files,
-        'keychain_path': str(plan.keychain), 'keychain_accounts': plan.accounts,
-        'keychain_backed_up': False,
-    }
-    write_private(backup / 'manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2).encode('utf-8'))
-    write_private(backup / 'journal.jsonl', b'')
-    # 所有备份完成后，再次检查状态，才允许修改用户数据。
+    if any(not is_hash(account) for account in plan.accounts):
+        raise ValueError('非法钥匙串账号，拒绝删除')
+    # 读取目标后再次检查；文件内容仅在内存中用于变化检测，不保存备份。
     if navicat_running():
         raise RuntimeError('Navicat 已重新启动，请退出后重试')
     assert_preferences_unchanged(plan)
     for path, content in contents.items():
         assert_file_unchanged(path, content)
-    with (backup / 'journal.jsonl').open('a', encoding='utf-8') as log:
+    completed = 0
+    try:
         expected = copy.deepcopy(plan.snapshot)
         for key in plan.keys:
-            journal(log, 'before_delete_preference', key)
             run_command('/usr/bin/defaults', 'delete', str(plan.preferences), key)
-            journal(log, 'deleted_preference', key)
+            completed += 1
+            print(f'已删除偏好设置键：{key}')
             del expected[key]
         if plan.keys and (read_preferences(plan.preferences) or {}) != expected:
             raise RuntimeError('偏好设置清理后的校验不一致，已停止后续操作')
         for path, content in contents.items():
             assert_file_unchanged(path, content)
-            journal(log, 'before_delete_file', str(path))
             path.unlink()
-            journal(log, 'deleted_file', str(path))
-        # 钥匙串操作无法通过文件备份恢复，放到最后。
+            completed += 1
+            print(f'已删除隐藏文件：{path}')
         for account in plan.accounts:
-            if not is_hash(account):
-                raise ValueError('非法钥匙串账号，拒绝删除')
-            journal(log, 'before_delete_keychain', account)
             run_command('/usr/bin/security', 'delete-generic-password', '-s', plan.service,
                         '-a', account, str(plan.keychain))
-            journal(log, 'deleted_keychain', account)
+            completed += 1
+            print(f'已删除钥匙串条目：{account}')
         if plan.accounts and set(plan.accounts).intersection(keychain_accounts(plan.keychain, plan.service)):
             raise RuntimeError('钥匙串中仍存在计划删除的条目')
-        journal(log, 'completed', 'all')
+    except (Exception, KeyboardInterrupt):
+        print(f'清理未全部完成，已执行 {completed} 项删除；未创建备份，已执行操作不会回滚。', file=sys.stderr)
+        raise
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true', help='执行清理；默认只预览')
     parser.add_argument('--app', type=Path, default=Path('/Applications/Navicat Premium.app'), help='应用路径')
-    parser.add_argument('--backup-dir', type=Path, help='自定义备份根目录')
-    parser.add_argument('--include-keychain', action='store_true', help='包含匹配的钥匙串条目；这些条目不会备份')
     args = parser.parse_args(argv)
     if sys.platform != 'darwin':
         parser.error('仅支持 macOS')
@@ -274,25 +216,22 @@ def main(argv=None):
     if not home.is_absolute() or home == Path('/'):
         parser.error('HOME 必须是用户主目录的绝对路径')
     try:
-        plan = build_plan(args.app.expanduser(), home, args.include_keychain)
+        plan = build_plan(args.app.expanduser(), home)
         print('模式：执行' if args.apply else '模式：仅预览')
         print_plan(plan)
-        if plan.needs_keychain and not args.include_keychain:
-            print('此版本可能还需清理钥匙串；当前未包含，可用 --include-keychain 单独预览。')
         if plan.empty:
             print('没有发现符合规则的目标；这不代表试用状态已重置。')
         elif not args.apply:
             print('预览结束，没有修改数据。核对后加 --apply 执行。')
         else:
-            backup_root = (args.backup_dir or home / 'Library/Application Support/HappyNavicat/backups').expanduser()
-            apply_plan(plan, backup_root)
+            apply_plan(plan)
             print('已完成列出的清理操作。是否生效需要重新打开 Navicat 验证。')
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, plistlib.InvalidFileException) as error:
         print(f'错误：{error}', file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print('已中断；若已开始执行，请检查备份和日志。', file=sys.stderr)
+        print('已中断；已执行的删除不会回滚。', file=sys.stderr)
         return 130
 
 
